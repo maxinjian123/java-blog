@@ -22,7 +22,7 @@ spring:
       max-request-size: 100MB   # 单次请求的总文件最大限制
 
 minio:
-  endpoint: http://111.228.9.147:9000  # MinIO 服务 API 地址 (注意是 API 端口，不能包含路径)
+  endpoint: http://xxx:9000  # MinIO 服务 API 地址 (注意是 API 端口，不能包含路径)
   accessKey: admin             # 访问密钥
   secretKey: Admin@123456             # 安全密钥
   bucketName: xiaoxiao             # 默认桶名称
