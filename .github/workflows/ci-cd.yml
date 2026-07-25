@@ -150,7 +150,11 @@ jobs:
           host: ${{ secrets.STAGING_HOST }}
           username: ${{ secrets.STAGING_USER }}
           key: ${{ secrets.STAGING_SSH_KEY }}
+          password: ${{ secrets.STAGING_SSH_PASSWORD }}
+          passphrase: ${{ secrets.STAGING_SSH_PASSPHRASE }}
           port: ${{ secrets.STAGING_PORT || 22 }}
+          timeout: 30s
+          command_timeout: 10m
           script_stop: true
           script: |
             cd ~/app/staging || mkdir -p ~/app/staging && cd ~/app/staging
@@ -239,7 +243,11 @@ jobs:
           host: ${{ secrets.PROD_HOST }}
           username: ${{ secrets.PROD_USER }}
           key: ${{ secrets.PROD_SSH_KEY }}
+          password: ${{ secrets.PROD_SSH_PASSWORD }}
+          passphrase: ${{ secrets.PROD_SSH_PASSPHRASE }}
           port: ${{ secrets.PROD_PORT || 22 }}
+          timeout: 30s
+          command_timeout: 15m
           script_stop: true
           script: |
             cd ~/app/production || mkdir -p ~/app/production && cd ~/app/production
