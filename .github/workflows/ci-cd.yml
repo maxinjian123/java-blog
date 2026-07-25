@@ -144,6 +144,72 @@ jobs:
     environment:
       name: staging
     steps:
+      - name: 生成 Staging Compose 文件 (base64)
+        id: compose
+        run: |
+          REPO_FULL=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')
+          sed 's/^\.//' > /tmp/staging-compose.yml <<'EOF'
+          .version: "3.8"
+          .services:
+          .  mysql:
+          .    image: mysql:8.0
+          .    container_name: staging-mysql
+          .    restart: unless-stopped
+          .    environment:
+          .      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+          .      MYSQL_DATABASE: personal_blog
+          .      TZ: Asia/Shanghai
+          .    ports:
+          .      - "13306:3306"
+          .    volumes:
+          .      - mysql-data:/var/lib/mysql
+          .    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+          .    networks:
+          .      - blog-net
+          .  redis:
+          .    image: redis:7-alpine
+          .    container_name: staging-redis
+          .    restart: unless-stopped
+          .    ports:
+          .      - "16379:6379"
+          .    volumes:
+          .      - redis-data:/data
+          .    command: redis-server --appendonly yes
+          .    networks:
+          .      - blog-net
+          .  app:
+          .    image: __APP_IMAGE__
+          .    container_name: staging-app
+          .    restart: unless-stopped
+          .    ports:
+          .      - "8081:8080"
+          .    pull_policy: always
+          .    environment:
+          .      SPRING_PROFILES_ACTIVE: prod
+          .      DB_USERNAME: root
+          .      DB_PASSWORD: ${DB_PASSWORD}
+          .      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/personal_blog?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+          .      SPRING_DATA_REDIS_HOST: redis
+          .      SPRING_DATA_REDIS_PORT: 6379
+          .      SPRING_DATA_REDIS_PASSWORD: ""
+          .      JAVA_OPTS: -Xms256m -Xmx1024m
+          .      TZ: Asia/Shanghai
+          .    depends_on:
+          .      - mysql
+          .      - redis
+          .    networks:
+          .      - blog-net
+          .volumes:
+          .  mysql-data:
+          .  redis-data:
+          .networks:
+          .  blog-net:
+          .    driver: bridge
+          EOF
+          sed -i "s|__APP_IMAGE__|ghcr.io/${REPO_FULL}:develop|g" /tmp/staging-compose.yml
+          COMPOSE_B64=$(base64 -w0 /tmp/staging-compose.yml)
+          echo "compose_b64=$COMPOSE_B64" >> "$GITHUB_OUTPUT"
+
       - name: 部署到 Staging 服务器
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -154,29 +220,35 @@ jobs:
           passphrase: ${{ secrets.STAGING_SSH_PASSPHRASE }}
           port: ${{ secrets.STAGING_PORT || 22 }}
           timeout: 30s
-          command_timeout: 10m
+          command_timeout: 20m
           script_stop: true
           script: |
             cd ~/app/staging || mkdir -p ~/app/staging && cd ~/app/staging
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-            REPO_FULL=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')
-            printf '%b' 'version: "3.8"\nservices:\n  mysql:\n    image: mysql:8.0\n    container_name: staging-mysql\n    restart: unless-stopped\n    environment:\n      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}\n      MYSQL_DATABASE: personal_blog\n      TZ: Asia/Shanghai\n    ports:\n      - "13306:3306"\n    volumes:\n      - mysql-data:/var/lib/mysql\n    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci\n    networks:\n      - blog-net\n  redis:\n    image: redis:7-alpine\n    container_name: staging-redis\n    restart: unless-stopped\n    ports:\n      - "16379:6379"\n    volumes:\n      - redis-data:/data\n    command: redis-server --appendonly yes\n    networks:\n      - blog-net\n  app:\n    image: ghcr.io/'"${REPO_FULL}"':develop\n    container_name: staging-app\n    restart: unless-stopped\n    ports:\n      - "8081:8080"\n    pull_policy: always\n    environment:\n      SPRING_PROFILES_ACTIVE: prod\n      DB_USERNAME: root\n      DB_PASSWORD: ${DB_PASSWORD}\n      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/personal_blog?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true\n      SPRING_DATA_REDIS_HOST: redis\n      SPRING_DATA_REDIS_PORT: 6379\n      SPRING_DATA_REDIS_PASSWORD: ""\n      JAVA_OPTS: -Xms256m -Xmx1024m\n      TZ: Asia/Shanghai\n    depends_on:\n      - mysql\n      - redis\n    networks:\n      - blog-net\nvolumes:\n  mysql-data:\n  redis-data:\nnetworks:\n  blog-net:\n    driver: bridge\n' > docker-compose.yml
+            echo '${{ steps.compose.outputs.compose_b64 }}' | base64 -d > docker-compose.yml
 
             DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }} docker-compose config -q > /dev/null 2>&1 || { echo "❌ docker-compose.yml 语法错误，内容如下："; cat docker-compose.yml; exit 1; }
+            echo "⬇️  拉取应用镜像..."
             DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }} docker-compose pull app
+            echo "🚀 启动容器..."
             DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }} docker-compose up -d
 
-            RETRY=0; MAX_RETRY=30
+            RETRY=0; MAX_RETRY=60
             while [ $RETRY -lt $MAX_RETRY ]; do
               if curl -sf http://localhost:8081/api/health > /dev/null 2>&1; then
                 echo "✅ Staging 部署成功"
                 break
               fi
-              RETRY=$((RETRY + 1)); sleep 3
+              RETRY=$((RETRY + 1)); sleep 5
               echo "等待中... ($RETRY/$MAX_RETRY)"
             done
-            [ $RETRY -ge $MAX_RETRY ] && { echo "❌ 超时"; docker-compose logs --tail=50 app; exit 1; }
+            if [ $RETRY -ge $MAX_RETRY ]; then
+              echo "❌ 健康检查超时，输出最近日志"
+              echo "=== mysql ==="; docker-compose logs --tail=30 mysql 2>/dev/null || true
+              echo "=== redis ==="; docker-compose logs --tail=20 redis 2>/dev/null || true
+              echo "=== app ===";   docker-compose logs --tail=100 app 2>/dev/null || true
+              exit 1
+            fi
             docker image prune -f
 
   deploy-production:
@@ -190,6 +262,77 @@ jobs:
     environment:
       name: production
     steps:
+      - name: 生成 Production Compose 文件 (base64)
+        id: compose
+        run: |
+          REPO_FULL=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')
+          sed 's/^\.//' > /tmp/prod-compose.yml <<'EOF'
+          .version: "3.8"
+          .services:
+          .  mysql:
+          .    image: mysql:8.0
+          .    container_name: blog-mysql
+          .    restart: unless-stopped
+          .    environment:
+          .      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+          .      MYSQL_DATABASE: personal_blog
+          .      TZ: Asia/Shanghai
+          .    ports:
+          .      - "3306:3306"
+          .    volumes:
+          .      - mysql-data:/var/lib/mysql
+          .    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+          .    networks:
+          .      - blog-net
+          .  redis:
+          .    image: redis:7-alpine
+          .    container_name: blog-redis
+          .    restart: unless-stopped
+          .    ports:
+          .      - "6379:6379"
+          .    volumes:
+          .      - redis-data:/data
+          .    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-}
+          .    networks:
+          .      - blog-net
+          .  app:
+          .    image: __APP_IMAGE__
+          .    container_name: java-blog
+          .    restart: unless-stopped
+          .    ports:
+          .      - "8080:8080"
+          .    pull_policy: always
+          .    environment:
+          .      SPRING_PROFILES_ACTIVE: prod
+          .      DB_USERNAME: root
+          .      DB_PASSWORD: ${DB_PASSWORD}
+          .      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/personal_blog?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+          .      SPRING_DATA_REDIS_HOST: redis
+          .      SPRING_DATA_REDIS_PORT: 6379
+          .      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+          .      JAVA_OPTS: -Xms512m -Xmx2048m -XX:+UseG1GC -XX:MaxGCPauseMillis=200
+          .      TZ: Asia/Shanghai
+          .    depends_on:
+          .      - mysql
+          .      - redis
+          .    logging:
+          .      driver: json-file
+          .      options:
+          .        max-size: "100m"
+          .        max-file: "5"
+          .    networks:
+          .      - blog-net
+          .volumes:
+          .  mysql-data:
+          .  redis-data:
+          .networks:
+          .  blog-net:
+          .    driver: bridge
+          EOF
+          sed -i "s|__APP_IMAGE__|ghcr.io/${REPO_FULL}:latest|g" /tmp/prod-compose.yml
+          COMPOSE_B64=$(base64 -w0 /tmp/prod-compose.yml)
+          echo "compose_b64=$COMPOSE_B64" >> "$GITHUB_OUTPUT"
+
       - name: 部署到 Production 服务器
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -200,14 +343,12 @@ jobs:
           passphrase: ${{ secrets.PROD_SSH_PASSPHRASE }}
           port: ${{ secrets.PROD_PORT || 22 }}
           timeout: 30s
-          command_timeout: 15m
+          command_timeout: 30m
           script_stop: true
           script: |
             cd ~/app/production || mkdir -p ~/app/production && cd ~/app/production
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-
-            REPO_FULL=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')
-            printf '%b' 'version: "3.8"\nservices:\n  mysql:\n    image: mysql:8.0\n    container_name: blog-mysql\n    restart: unless-stopped\n    environment:\n      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}\n      MYSQL_DATABASE: personal_blog\n      TZ: Asia/Shanghai\n    ports:\n      - "3306:3306"\n    volumes:\n      - mysql-data:/var/lib/mysql\n    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci\n    networks:\n      - blog-net\n  redis:\n    image: redis:7-alpine\n    container_name: blog-redis\n    restart: unless-stopped\n    ports:\n      - "6379:6379"\n    volumes:\n      - redis-data:/data\n    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-}\n    networks:\n      - blog-net\n  app:\n    image: ghcr.io/'"${REPO_FULL}"':latest\n    container_name: java-blog\n    restart: unless-stopped\n    ports:\n      - "8080:8080"\n    pull_policy: always\n    environment:\n      SPRING_PROFILES_ACTIVE: prod\n      DB_USERNAME: root\n      DB_PASSWORD: ${DB_PASSWORD}\n      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/personal_blog?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true\n      SPRING_DATA_REDIS_HOST: redis\n      SPRING_DATA_REDIS_PORT: 6379\n      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-}\n      JAVA_OPTS: -Xms512m -Xmx2048m -XX:+UseG1GC -XX:MaxGCPauseMillis=200\n      TZ: Asia/Shanghai\n    depends_on:\n      - mysql\n      - redis\n    logging:\n      driver: json-file\n      options:\n        max-size: "100m"\n        max-file: "5"\n    networks:\n      - blog-net\nvolumes:\n  mysql-data:\n  redis-data:\nnetworks:\n  blog-net:\n    driver: bridge\n' > docker-compose.yml
+            echo '${{ steps.compose.outputs.compose_b64 }}' | base64 -d > docker-compose.yml
 
             DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} REDIS_PASSWORD=${{ secrets.PROD_REDIS_PASSWORD }} docker-compose config -q > /dev/null 2>&1 || { echo "❌ docker-compose.yml 语法错误，内容如下："; cat docker-compose.yml; exit 1; }
 
@@ -218,18 +359,26 @@ jobs:
               sh -c 'mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" personal_blog' > "$BACKUP_FILE" 2>/dev/null || true
             [ -s "$BACKUP_FILE" ] && echo "   备份完成: $BACKUP_FILE" || echo "   备份跳过(首次部署)"
 
+            echo "⬇️  拉取应用镜像..."
             DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} REDIS_PASSWORD=${{ secrets.PROD_REDIS_PASSWORD }} docker-compose pull app
+            echo "🚀 启动容器..."
             DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} REDIS_PASSWORD=${{ secrets.PROD_REDIS_PASSWORD }} docker-compose up -d --no-deps app
 
-            RETRY=0; MAX_RETRY=30
+            RETRY=0; MAX_RETRY=60
             while [ $RETRY -lt $MAX_RETRY ]; do
               if curl -sf http://localhost:8080/api/health > /dev/null 2>&1; then
                 echo "✅ Production 部署成功"
                 echo "   API 文档: ${{ secrets.PRODUCTION_URL }}/api/doc.html"
                 break
               fi
-              RETRY=$((RETRY + 1)); sleep 3
+              RETRY=$((RETRY + 1)); sleep 5
               echo "等待中... ($RETRY/$MAX_RETRY)"
             done
-            [ $RETRY -ge $MAX_RETRY ] && { echo "❌ 超时"; docker-compose logs --tail=100 app; exit 1; }
+            if [ $RETRY -ge $MAX_RETRY ]; then
+              echo "❌ 健康检查超时，输出最近日志"
+              echo "=== mysql ==="; docker-compose logs --tail=30 mysql 2>/dev/null || true
+              echo "=== redis ==="; docker-compose logs --tail=20 redis 2>/dev/null || true
+              echo "=== app ===";   docker-compose logs --tail=100 app 2>/dev/null || true
+              exit 1
+            fi
             docker image prune -f; docker container prune -f
