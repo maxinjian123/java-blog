@@ -211,8 +211,8 @@ jobs:
                 driver: bridge
             COMPOSE_EOF
 
-            DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }} docker compose pull app
-            DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }} docker compose up -d
+            DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }} docker-compose pull app
+            DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }} docker-compose up -d
 
             RETRY=0; MAX_RETRY=30
             while [ $RETRY -lt $MAX_RETRY ]; do
@@ -223,7 +223,7 @@ jobs:
               RETRY=$((RETRY + 1)); sleep 3
               echo "等待中... ($RETRY/$MAX_RETRY)"
             done
-            [ $RETRY -ge $MAX_RETRY ] && { echo "❌ 超时"; docker compose logs --tail=50 app; exit 1; }
+            [ $RETRY -ge $MAX_RETRY ] && { echo "❌ 超时"; docker-compose logs --tail=50 app; exit 1; }
             docker image prune -f
 
   deploy-production:
@@ -308,14 +308,14 @@ jobs:
             echo "💾 部署前数据库备份..."
             mkdir -p ~/app/backups
             BACKUP_FILE=~/app/backups/db-backup-$(date +%Y%m%d%H%M%S).sql
-            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} docker compose exec -T mysql \
+            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} docker-compose exec -T mysql \
               sh -c 'mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" personal_blog' > "$BACKUP_FILE" 2>/dev/null || true
             [ -s "$BACKUP_FILE" ] && echo "   备份完成: $BACKUP_FILE" || echo "   备份跳过(首次部署)"
 
             DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} REDIS_PASSWORD=${{ secrets.PROD_REDIS_PASSWORD }} \
-              docker compose pull app
+              docker-compose pull app
             DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} REDIS_PASSWORD=${{ secrets.PROD_REDIS_PASSWORD }} \
-              docker compose up -d --no-deps app
+              docker-compose up -d --no-deps app
 
             RETRY=0; MAX_RETRY=30
             while [ $RETRY -lt $MAX_RETRY ]; do
@@ -327,5 +327,5 @@ jobs:
               RETRY=$((RETRY + 1)); sleep 3
               echo "等待中... ($RETRY/$MAX_RETRY)"
             done
-            [ $RETRY -ge $MAX_RETRY ] && { echo "❌ 超时"; docker compose logs --tail=100 app; exit 1; }
+            [ $RETRY -ge $MAX_RETRY ] && { echo "❌ 超时"; docker-compose logs --tail=100 app; exit 1; }
             docker image prune -f; docker container prune -f
