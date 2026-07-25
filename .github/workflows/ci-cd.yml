@@ -230,7 +230,7 @@ COMPOSE_EOF
               fi
               RETRY=$((RETRY + 1)); sleep 3
               echo "等待中... ($RETRY/$MAX_RETRY)"
-            done
+            done 
             [ $RETRY -ge $MAX_RETRY ] && { echo "❌ 超时"; docker compose logs --tail=50 app; exit 1; }
             docker image prune -f
 
