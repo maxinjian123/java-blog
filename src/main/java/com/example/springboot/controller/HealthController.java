@@ -14,7 +14,7 @@ import org.springframework.web.bind.annotation.RestController;
 public class HealthController {
 
     @Operation(summary = "健康检查", description = "检测服务是否正常运行")
-    @GetMapping("/health")
+    @GetMapping
     public BaseResponse<String> health() {
         return ResultUtils.success("ok");
     }

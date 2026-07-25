@@ -1,0 +1,325 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    tags:
+      - 'v*'
+    paths-ignore:
+      - 'README.md'
+      - '.gitignore'
+      - 'docs/**'
+
+  pull_request:
+    branches:
+      - main
+      - develop
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: '部署环境'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  JAVA_VERSION: '17'
+  MAVEN_OPTS: '-Dmaven.wagon.http.retryHandler.count=3'
+
+jobs:
+  test-and-build:
+    name: 测试与构建
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: 设置 JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Maven 验证与编译
+        run: mvn -B validate compile
+
+      - name: 运行单元测试
+        run: mvn -B test
+
+      - name: 上传测试报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: target/surefire-reports/
+          retention-days: 7
+
+      - name: Maven 打包 (跳过测试)
+        if: success()
+        run: mvn -B clean package -DskipTests
+
+      - name: 上传构建产物 JAR
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/*.jar
+          retention-days: 14
+
+  docker-build-and-push:
+    name: Docker 构建与推送
+    runs-on: ubuntu-latest
+    needs: test-and-build
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: 下载构建产物 JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: target/
+
+      - name: 确认 JAR 文件存在
+        run: ls -la target/*.jar
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 提取镜像元数据
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: 构建并推送镜像
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+  deploy-staging:
+    name: 部署到 Staging 环境
+    runs-on: ubuntu-latest
+    needs: docker-build-and-push
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/develop') ||
+      (github.event_name == 'workflow_dispatch' && inputs.environment == 'staging')
+    environment:
+      name: staging
+      url: ${{ secrets.STAGING_URL }}
+    steps:
+      - name: 部署到 Staging 服务器
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          port: ${{ secrets.STAGING_PORT || 22 }}
+          script_stop: true
+          script: |
+            cd ~/app/staging || mkdir -p ~/app/staging && cd ~/app/staging
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            cat > docker-compose.yml << 'COMPOSE_EOF'
+            version: '3.8'
+            services:
+              mysql:
+                image: mysql:8.0
+                container_name: staging-mysql
+                restart: unless-stopped
+                environment:
+                  MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+                  MYSQL_DATABASE: personal_blog
+                  TZ: Asia/Shanghai
+                ports:
+                  - "13306:3306"
+                volumes:
+                  - mysql-data:/var/lib/mysql
+                command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+                networks: [blog-net]
+              redis:
+                image: redis:7-alpine
+                container_name: staging-redis
+                restart: unless-stopped
+                ports: ["16379:6379"]
+                volumes: [redis-data:/data]
+                command: redis-server --appendonly yes
+                networks: [blog-net]
+              app:
+                image: ghcr.io/${{ github.repository }}:develop
+                container_name: staging-app
+                restart: unless-stopped
+                ports: ["8081:8080"]
+                pull_policy: always
+                environment:
+                  SPRING_PROFILES_ACTIVE: prod
+                  DB_USERNAME: root
+                  DB_PASSWORD: ${DB_PASSWORD}
+                  SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/personal_blog?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+                  SPRING_DATA_REDIS_HOST: redis
+                  SPRING_DATA_REDIS_PORT: 6379
+                  SPRING_DATA_REDIS_PASSWORD: ""
+                  JAVA_OPTS: -Xms256m -Xmx1024m
+                  TZ: Asia/Shanghai
+                depends_on: [mysql, redis]
+                networks: [blog-net]
+            volumes:
+              mysql-data:
+              redis-data:
+            networks:
+              blog-net:
+                driver: bridge
+            COMPOSE_EOF
+
+            DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }} docker compose pull app
+            DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }} docker compose up -d
+
+            RETRY=0; MAX_RETRY=30
+            while [ $RETRY -lt $MAX_RETRY ]; do
+              if curl -sf http://localhost:8081/api/health > /dev/null 2>&1; then
+                echo "✅ Staging 部署成功"
+                break
+              fi
+              RETRY=$((RETRY + 1)); sleep 3
+              echo "等待中... ($RETRY/$MAX_RETRY)"
+            done
+            [ $RETRY -ge $MAX_RETRY ] && { echo "❌ 超时"; docker compose logs --tail=50 app; exit 1; }
+            docker image prune -f
+
+  deploy-production:
+    name: 部署到 Production 环境
+    runs-on: ubuntu-latest
+    needs: docker-build-and-push
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.environment == 'production')
+    environment:
+      name: production
+      url: ${{ secrets.PRODUCTION_URL }}
+    steps:
+      - name: 部署到 Production 服务器
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          port: ${{ secrets.PROD_PORT || 22 }}
+          script_stop: true
+          script: |
+            cd ~/app/production || mkdir -p ~/app/production && cd ~/app/production
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            cat > docker-compose.yml << 'COMPOSE_EOF'
+            version: '3.8'
+            services:
+              mysql:
+                image: mysql:8.0
+                container_name: blog-mysql
+                restart: unless-stopped
+                environment:
+                  MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+                  MYSQL_DATABASE: personal_blog
+                  TZ: Asia/Shanghai
+                ports: ["3306:3306"]
+                volumes: [mysql-data:/var/lib/mysql]
+                command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+                networks: [blog-net]
+              redis:
+                image: redis:7-alpine
+                container_name: blog-redis
+                restart: unless-stopped
+                ports: ["6379:6379"]
+                volumes: [redis-data:/data]
+                command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-}
+                networks: [blog-net]
+              app:
+                image: ghcr.io/${{ github.repository }}:latest
+                container_name: java-blog
+                restart: unless-stopped
+                ports: ["8080:8080"]
+                pull_policy: always
+                environment:
+                  SPRING_PROFILES_ACTIVE: prod
+                  DB_USERNAME: root
+                  DB_PASSWORD: ${DB_PASSWORD}
+                  SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/personal_blog?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+                  SPRING_DATA_REDIS_HOST: redis
+                  SPRING_DATA_REDIS_PORT: 6379
+                  SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+                  JAVA_OPTS: -Xms512m -Xmx2048m -XX:+UseG1GC -XX:MaxGCPauseMillis=200
+                  TZ: Asia/Shanghai
+                depends_on: [mysql, redis]
+                logging:
+                  driver: json-file
+                  options: {max-size: "100m", max-file: "5"}
+                networks: [blog-net]
+            volumes:
+              mysql-data:
+              redis-data:
+            networks:
+              blog-net:
+                driver: bridge
+            COMPOSE_EOF
+
+            echo "💾 部署前数据库备份..."
+            mkdir -p ~/app/backups
+            BACKUP_FILE=~/app/backups/db-backup-$(date +%Y%m%d%H%M%S).sql
+            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} docker compose exec -T mysql \
+              sh -c 'mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" personal_blog' > "$BACKUP_FILE" 2>/dev/null || true
+            [ -s "$BACKUP_FILE" ] && echo "   备份完成: $BACKUP_FILE" || echo "   备份跳过(首次部署)"
+
+            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} REDIS_PASSWORD=${{ secrets.PROD_REDIS_PASSWORD }} \
+              docker compose pull app
+            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} REDIS_PASSWORD=${{ secrets.PROD_REDIS_PASSWORD }} \
+              docker compose up -d --no-deps app
+
+            RETRY=0; MAX_RETRY=30
+            while [ $RETRY -lt $MAX_RETRY ]; do
+              if curl -sf http://localhost:8080/api/health > /dev/null 2>&1; then
+                echo "✅ Production 部署成功"
+                echo "   API 文档: ${{ secrets.PRODUCTION_URL }}/api/doc.html"
+                break
+              fi
+              RETRY=$((RETRY + 1)); sleep 3
+              echo "等待中... ($RETRY/$MAX_RETRY)"
+            done
+            [ $RETRY -ge $MAX_RETRY ] && { echo "❌ 超时"; docker compose logs --tail=100 app; exit 1; }
+            docker image prune -f; docker container prune -f
