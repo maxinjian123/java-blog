@@ -1,4 +1,4 @@
-FROM eclipse-temurin:17-jre-alpine
+FROM amazoncorretto:17-alpine3.20-jre
 
 WORKDIR /app
 
@@ -7,7 +7,7 @@ RUN apk add --no-cache tzdata \
     && echo "Asia/Shanghai" > /etc/timezone \
     && apk del tzdata
 
-COPY ./springboot-1.0.0-SNAPSHOT.jar app.jar
+COPY target/springboot-1.0.0-SNAPSHOT.jar app.jar
 
 ENV JAVA_OPTS="-Xms512m -Xmx1024m -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
 ENV SPRING_PROFILES_ACTIVE=prod
