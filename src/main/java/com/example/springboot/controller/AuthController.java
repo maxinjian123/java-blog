@@ -3,6 +3,7 @@ package com.example.springboot.controller;
 import com.example.springboot.common.BaseResponse;
 import com.example.springboot.common.ResultUtils;
 import com.example.springboot.common.UserContext;
+import com.example.springboot.common.annotation.Auth;
 import com.example.springboot.dto.LoginDTO;
 import com.example.springboot.entity.User;
 import com.example.springboot.service.UserService;
@@ -35,5 +36,16 @@ public class AuthController {
         }
         session.setAttribute("currentUser", currentUser);
         return ResultUtils.success(userVO, "登录成功");
+    }
+
+    @Auth
+    @Operation(summary = "用户退出登录", description = "销毁当前会话，清除Redis中的Session数据")
+    @PostMapping("/logout")
+    public BaseResponse<Boolean> logout(HttpSession session) {
+        User currentUser = UserContext.getCurrentUser();
+        if (currentUser != null) {
+            session.invalidate();
+        }
+        return ResultUtils.success(true, "退出登录成功");
     }
 }

@@ -134,6 +134,8 @@ CREATE TABLE `comments`
     `nickname`   VARCHAR(50)                                        NOT NULL COMMENT '评论者昵称',
     `email`      VARCHAR(100)                                       NOT NULL COMMENT '评论者邮箱',
     `email_md5`  VARCHAR(32) GENERATED ALWAYS AS (MD5(LOWER(TRIM(`email`)))) STORED COMMENT 'Gravatar 头像 MD5 虚拟生成列',
+    # MySQL 版本（9.6 及以上版本）选⬇️
+    #  `email_md5`  VARCHAR(32) GENERATED ALWAYS AS (SHA2(email, 256)) VIRTUAL  COMMENT 'Gravatar 头像 MD5 虚拟生成列',
     `website`    VARCHAR(255)                                                DEFAULT NULL COMMENT '个人网站',
     `content`    TEXT                                               NOT NULL COMMENT '评论内容',
     `ip`         VARCHAR(45)                                                 DEFAULT NULL COMMENT '评论者IP',
