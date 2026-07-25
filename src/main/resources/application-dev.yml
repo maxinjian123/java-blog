@@ -43,13 +43,3 @@ logging:
   level:
     com.example.springboot: debug
 
-# springdoc-openapi
-springdoc:
-  group-configs:
-    - group: 'default'
-      packages-to-scan: com.example.springboot.controller
-# knife4j
-knife4j:
-  enable: true
-  setting:
-    language: zh_cn
