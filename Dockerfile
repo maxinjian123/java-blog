@@ -1,4 +1,4 @@
-FROM amazoncorretto:17-alpine3.20-jre
+FROM amazoncorretto:17-alpine
 
 WORKDIR /app
 
