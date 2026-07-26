@@ -122,7 +122,7 @@ jobs:
             type=sha,prefix=sha-
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: 构建并推送镜像
+      - name: 构建并推送镜像 (多平台 ghcr.io 备份)
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -133,6 +133,31 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64
+
+      - name: 本地单平台构建 (amd64) 用于 SCP 直传
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: local-build:current
+          cache-from: type=gha
+          platforms: linux/amd64
+
+      - name: 导出镜像为 tar.gz (SCP 传服务器用，绕开 ghcr.io 国际链路)
+        run: |
+          echo "镜像大小:"; docker image ls local-build:current --format '{{.Size}}'
+          echo "开始导出并 gzip 压缩..."
+          docker save local-build:current | gzip -1 > app-image.tar.gz
+          ls -lh app-image.tar.gz
+
+      - name: 上传镜像 tar 包
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-image-tar
+          path: app-image.tar.gz
+          retention-days: 3
 
   deploy-staging:
     name: 部署到 Staging 环境
@@ -147,7 +172,6 @@ jobs:
       - name: 生成 Staging Compose 文件 (base64)
         id: compose
         run: |
-          REPO_FULL=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')
           sed 's/^\.//' > /tmp/staging-compose.yml <<'EOF'
           .version: "3.8"
           .services:
@@ -178,12 +202,11 @@ jobs:
           .    networks:
           .      - blog-net
           .  app:
-          .    image: __APP_IMAGE__
+          .    image: local/java-blog:develop
           .    container_name: staging-app
           .    restart: unless-stopped
           .    ports:
           .      - "8081:8080"
-          .    pull_policy: always
           .    environment:
           .      SPRING_PROFILES_ACTIVE: prod
           .      DB_USERNAME: root
@@ -206,9 +229,28 @@ jobs:
           .  blog-net:
           .    driver: bridge
           EOF
-          sed -i "s|__APP_IMAGE__|ghcr.io/${REPO_FULL}:develop|g" /tmp/staging-compose.yml
           COMPOSE_B64=$(base64 -w0 /tmp/staging-compose.yml)
           echo "compose_b64=$COMPOSE_B64" >> "$GITHUB_OUTPUT"
+
+      - name: 下载镜像 tar 包
+        uses: actions/download-artifact@v4
+        with:
+          name: app-image-tar
+
+      - name: SCP 上传镜像到 Staging 服务器
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.STAGING_USER }}
+          key: ${{ secrets.STAGING_SSH_KEY }}
+          password: ${{ secrets.STAGING_SSH_PASSWORD }}
+          passphrase: ${{ secrets.STAGING_SSH_PASSPHRASE }}
+          port: ${{ secrets.STAGING_PORT || 22 }}
+          timeout: 60s
+          command_timeout: 30m
+          source: app-image.tar.gz
+          target: ~/app/staging/
+          strip_components: 0
 
       - name: 部署到 Staging 服务器
         uses: appleboy/ssh-action@v1.2.0
@@ -224,14 +266,18 @@ jobs:
           script_stop: true
           script: |
             cd ~/app/staging || mkdir -p ~/app/staging && cd ~/app/staging
-            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
             echo '${{ steps.compose.outputs.compose_b64 }}' | base64 -d > docker-compose.yml
 
-            DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }} docker-compose config -q > /dev/null 2>&1 || { echo "❌ docker-compose.yml 语法错误，内容如下："; cat docker-compose.yml; exit 1; }
-            echo "⬇️  拉取应用镜像..."
-            DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }} docker-compose pull app
+            DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }} docker compose config -q > /dev/null 2>&1 || { echo "❌ docker-compose.yml 语法错误，内容如下："; cat docker-compose.yml; exit 1; }
+
+            echo "📦 导入应用镜像 (docker load)..."
+            [ -f app-image.tar.gz ] || { echo "❌ app-image.tar.gz 不存在"; ls -la; exit 1; }
+            gunzip -c app-image.tar.gz | docker load
+            echo "🏷️  打镜像 Tag: local-build:current → local/java-blog:develop"
+            docker tag local-build:current local/java-blog:develop
+
             echo "🚀 启动容器..."
-            DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }} docker-compose up -d
+            DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }} docker compose up -d
 
             RETRY=0; MAX_RETRY=60
             while [ $RETRY -lt $MAX_RETRY ]; do
@@ -244,11 +290,12 @@ jobs:
             done
             if [ $RETRY -ge $MAX_RETRY ]; then
               echo "❌ 健康检查超时，输出最近日志"
-              echo "=== mysql ==="; docker-compose logs --tail=30 mysql 2>/dev/null || true
-              echo "=== redis ==="; docker-compose logs --tail=20 redis 2>/dev/null || true
-              echo "=== app ===";   docker-compose logs --tail=100 app 2>/dev/null || true
+              echo "=== mysql ==="; docker compose logs --tail=30 mysql 2>/dev/null || true
+              echo "=== redis ==="; docker compose logs --tail=20 redis 2>/dev/null || true
+              echo "=== app ===";   docker compose logs --tail=100 app 2>/dev/null || true
               exit 1
             fi
+            rm -f app-image.tar.gz
             docker image prune -f
 
   deploy-production:
@@ -265,7 +312,6 @@ jobs:
       - name: 生成 Production Compose 文件 (base64)
         id: compose
         run: |
-          REPO_FULL=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')
           sed 's/^\.//' > /tmp/prod-compose.yml <<'EOF'
           .version: "3.8"
           .services:
@@ -296,12 +342,11 @@ jobs:
           .    networks:
           .      - blog-net
           .  app:
-          .    image: __APP_IMAGE__
+          .    image: local/java-blog:latest
           .    container_name: java-blog
           .    restart: unless-stopped
           .    ports:
           .      - "8080:8080"
-          .    pull_policy: always
           .    environment:
           .      SPRING_PROFILES_ACTIVE: prod
           .      DB_USERNAME: root
@@ -329,9 +374,28 @@ jobs:
           .  blog-net:
           .    driver: bridge
           EOF
-          sed -i "s|__APP_IMAGE__|ghcr.io/${REPO_FULL}:latest|g" /tmp/prod-compose.yml
           COMPOSE_B64=$(base64 -w0 /tmp/prod-compose.yml)
           echo "compose_b64=$COMPOSE_B64" >> "$GITHUB_OUTPUT"
+
+      - name: 下载镜像 tar 包
+        uses: actions/download-artifact@v4
+        with:
+          name: app-image-tar
+
+      - name: SCP 上传镜像到 Production 服务器
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.PROD_HOST }}
+          username: ${{ secrets.PROD_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          password: ${{ secrets.PROD_SSH_PASSWORD }}
+          passphrase: ${{ secrets.PROD_SSH_PASSPHRASE }}
+          port: ${{ secrets.PROD_PORT || 22 }}
+          timeout: 60s
+          command_timeout: 30m
+          source: app-image.tar.gz
+          target: ~/app/production/
+          strip_components: 0
 
       - name: 部署到 Production 服务器
         uses: appleboy/ssh-action@v1.2.0
@@ -347,22 +411,25 @@ jobs:
           script_stop: true
           script: |
             cd ~/app/production || mkdir -p ~/app/production && cd ~/app/production
-            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
             echo '${{ steps.compose.outputs.compose_b64 }}' | base64 -d > docker-compose.yml
 
-            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} REDIS_PASSWORD=${{ secrets.PROD_REDIS_PASSWORD }} docker-compose config -q > /dev/null 2>&1 || { echo "❌ docker-compose.yml 语法错误，内容如下："; cat docker-compose.yml; exit 1; }
+            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} REDIS_PASSWORD=${{ secrets.PROD_REDIS_PASSWORD }} docker compose config -q > /dev/null 2>&1 || { echo "❌ docker-compose.yml 语法错误，内容如下："; cat docker-compose.yml; exit 1; }
 
             echo "💾 部署前数据库备份..."
             mkdir -p ~/app/backups
             BACKUP_FILE=~/app/backups/db-backup-$(date +%Y%m%d%H%M%S).sql
-            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} docker-compose exec -T mysql \
+            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} docker compose exec -T mysql \
               sh -c 'mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" personal_blog' > "$BACKUP_FILE" 2>/dev/null || true
             [ -s "$BACKUP_FILE" ] && echo "   备份完成: $BACKUP_FILE" || echo "   备份跳过(首次部署)"
 
-            echo "⬇️  拉取应用镜像..."
-            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} REDIS_PASSWORD=${{ secrets.PROD_REDIS_PASSWORD }} docker-compose pull app
+            echo "📦 导入应用镜像 (docker load)..."
+            [ -f app-image.tar.gz ] || { echo "❌ app-image.tar.gz 不存在"; ls -la; exit 1; }
+            gunzip -c app-image.tar.gz | docker load
+            echo "🏷️  打镜像 Tag: local-build:current → local/java-blog:latest"
+            docker tag local-build:current local/java-blog:latest
+
             echo "🚀 启动容器..."
-            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} REDIS_PASSWORD=${{ secrets.PROD_REDIS_PASSWORD }} docker-compose up -d --no-deps app
+            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} REDIS_PASSWORD=${{ secrets.PROD_REDIS_PASSWORD }} docker compose up -d --no-deps app
 
             RETRY=0; MAX_RETRY=60
             while [ $RETRY -lt $MAX_RETRY ]; do
@@ -376,9 +443,10 @@ jobs:
             done
             if [ $RETRY -ge $MAX_RETRY ]; then
               echo "❌ 健康检查超时，输出最近日志"
-              echo "=== mysql ==="; docker-compose logs --tail=30 mysql 2>/dev/null || true
-              echo "=== redis ==="; docker-compose logs --tail=20 redis 2>/dev/null || true
-              echo "=== app ===";   docker-compose logs --tail=100 app 2>/dev/null || true
+              echo "=== mysql ==="; docker compose logs --tail=30 mysql 2>/dev/null || true
+              echo "=== redis ==="; docker compose logs --tail=20 redis 2>/dev/null || true
+              echo "=== app ===";   docker compose logs --tail=100 app 2>/dev/null || true
               exit 1
             fi
+            rm -f app-image.tar.gz
             docker image prune -f; docker container prune -f
