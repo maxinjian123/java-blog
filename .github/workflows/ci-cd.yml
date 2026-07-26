@@ -262,7 +262,7 @@ jobs:
           passphrase: ${{ secrets.STAGING_SSH_PASSPHRASE }}
           port: ${{ secrets.STAGING_PORT || 22 }}
           timeout: 30s
-          command_timeout: 20m
+          command_timeout: 30m
           script_stop: true
           script: |
             cd ~/app/staging || mkdir -p ~/app/staging && cd ~/app/staging
@@ -272,12 +272,19 @@ jobs:
 
             echo "📦 导入应用镜像 (docker load)..."
             [ -f app-image.tar.gz ] || { echo "❌ app-image.tar.gz 不存在"; ls -la; exit 1; }
-            gunzip -c app-image.tar.gz | docker load
+            echo "文件大小: $(du -h app-image.tar.gz | cut -f1)"
+            gunzip -c app-image.tar.gz | docker load || { echo "❌ docker load 失败，tar 包可能损坏"; ls -la app-image.tar.gz; exit 1; }
             echo "🏷️  打镜像 Tag: local-build:current → local/java-blog:develop"
             docker tag local-build:current local/java-blog:develop
+            docker image ls --format '{{.Repository}}:{{.Tag}}\t{{.Size}}' | grep -E 'local/java-blog|local-build'
 
-            echo "🚀 启动容器..."
+            echo "🛢️  拉取依赖镜像 (mysql + redis)..."
+            DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }} docker compose pull mysql redis 2>&1 | tail -20
+
+            echo "🚀 启动所有容器 (依赖+应用)..."
             DB_PASSWORD=${{ secrets.STAGING_DB_PASSWORD }} docker compose up -d
+            sleep 3
+            docker compose ps
 
             RETRY=0; MAX_RETRY=60
             while [ $RETRY -lt $MAX_RETRY ]; do
@@ -290,9 +297,10 @@ jobs:
             done
             if [ $RETRY -ge $MAX_RETRY ]; then
               echo "❌ 健康检查超时，输出最近日志"
-              echo "=== mysql ==="; docker compose logs --tail=30 mysql 2>/dev/null || true
+              echo "=== 容器状态 ==="; docker compose ps 2>/dev/null || true
+              echo "=== mysql ==="; docker compose logs --tail=40 mysql 2>/dev/null || true
               echo "=== redis ==="; docker compose logs --tail=20 redis 2>/dev/null || true
-              echo "=== app ===";   docker compose logs --tail=100 app 2>/dev/null || true
+              echo "=== app ===";   docker compose logs --tail=150 app 2>/dev/null || true
               exit 1
             fi
             rm -f app-image.tar.gz
@@ -407,7 +415,7 @@ jobs:
           passphrase: ${{ secrets.PROD_SSH_PASSPHRASE }}
           port: ${{ secrets.PROD_PORT || 22 }}
           timeout: 30s
-          command_timeout: 30m
+          command_timeout: 40m
           script_stop: true
           script: |
             cd ~/app/production || mkdir -p ~/app/production && cd ~/app/production
@@ -415,21 +423,29 @@ jobs:
 
             DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} REDIS_PASSWORD=${{ secrets.PROD_REDIS_PASSWORD }} docker compose config -q > /dev/null 2>&1 || { echo "❌ docker-compose.yml 语法错误，内容如下："; cat docker-compose.yml; exit 1; }
 
+            echo "📦 导入应用镜像 (docker load)..."
+            [ -f app-image.tar.gz ] || { echo "❌ app-image.tar.gz 不存在"; ls -la; exit 1; }
+            echo "文件大小: $(du -h app-image.tar.gz | cut -f1)"
+            gunzip -c app-image.tar.gz | docker load || { echo "❌ docker load 失败，tar 包可能损坏"; ls -la app-image.tar.gz; exit 1; }
+            echo "🏷️  打镜像 Tag: local-build:current → local/java-blog:latest"
+            docker tag local-build:current local/java-blog:latest
+            docker image ls --format '{{.Repository}}:{{.Tag}}\t{{.Size}}' | grep -E 'local/java-blog|local-build'
+
+            echo "🛢️  拉取依赖镜像 (mysql + redis)..."
+            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} REDIS_PASSWORD=${{ secrets.PROD_REDIS_PASSWORD }} docker compose pull mysql redis 2>&1 | tail -20
+
             echo "💾 部署前数据库备份..."
             mkdir -p ~/app/backups
             BACKUP_FILE=~/app/backups/db-backup-$(date +%Y%m%d%H%M%S).sql
-            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} docker compose exec -T mysql \
-              sh -c 'mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" personal_blog' > "$BACKUP_FILE" 2>/dev/null || true
-            [ -s "$BACKUP_FILE" ] && echo "   备份完成: $BACKUP_FILE" || echo "   备份跳过(首次部署)"
+            ( DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} docker compose ps mysql 2>/dev/null | grep -q 'Up' ) && \
+              DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} docker compose exec -T mysql \
+                sh -c 'mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" personal_blog' > "$BACKUP_FILE" 2>/dev/null || true
+            [ -s "$BACKUP_FILE" ] && echo "   备份完成: $BACKUP_FILE ($(du -h "$BACKUP_FILE" | cut -f1))" || echo "   备份跳过(首次部署或 mysql 未运行)"
 
-            echo "📦 导入应用镜像 (docker load)..."
-            [ -f app-image.tar.gz ] || { echo "❌ app-image.tar.gz 不存在"; ls -la; exit 1; }
-            gunzip -c app-image.tar.gz | docker load
-            echo "🏷️  打镜像 Tag: local-build:current → local/java-blog:latest"
-            docker tag local-build:current local/java-blog:latest
-
-            echo "🚀 启动容器..."
-            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} REDIS_PASSWORD=${{ secrets.PROD_REDIS_PASSWORD }} docker compose up -d --no-deps app
+            echo "🚀 启动所有容器 (依赖+应用)..."
+            DB_PASSWORD=${{ secrets.PROD_DB_PASSWORD }} REDIS_PASSWORD=${{ secrets.PROD_REDIS_PASSWORD }} docker compose up -d
+            sleep 5
+            docker compose ps
 
             RETRY=0; MAX_RETRY=60
             while [ $RETRY -lt $MAX_RETRY ]; do
@@ -443,9 +459,10 @@ jobs:
             done
             if [ $RETRY -ge $MAX_RETRY ]; then
               echo "❌ 健康检查超时，输出最近日志"
-              echo "=== mysql ==="; docker compose logs --tail=30 mysql 2>/dev/null || true
+              echo "=== 容器状态 ==="; docker compose ps 2>/dev/null || true
+              echo "=== mysql ==="; docker compose logs --tail=40 mysql 2>/dev/null || true
               echo "=== redis ==="; docker compose logs --tail=20 redis 2>/dev/null || true
-              echo "=== app ===";   docker compose logs --tail=100 app 2>/dev/null || true
+              echo "=== app ===";   docker compose logs --tail=150 app 2>/dev/null || true
               exit 1
             fi
             rm -f app-image.tar.gz
